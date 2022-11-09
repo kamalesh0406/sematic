@@ -6,7 +6,6 @@ import stat
 import sys
 import time
 import traceback
-from pathlib import Path
 from typing import Callable, Optional
 
 # Sematic
@@ -29,15 +28,16 @@ An overview of how logging works:
 
 
 DEFAULT_LOG_UPLOAD_INTERVAL_SECONDS = 10
+_LAST_NON_EMPTY_DELTA_TEMPLATE = "{}.previous"
 
 
 def _flush_to_file(file_path, read_handle, uploader, remote_prefix, timeout=None):
-    if os.path.exists(file_path):
-        # we only want to record "deltas" in the logs; clean up before each
-        # session of streaming to file.
-        os.remove(file_path)
+    if os.path.exists(file_path) and os.stat(file_path)[stat.ST_SIZE] > 0:
+        # save the last non-empty delta file somewhere for tailing
+        os.rename(file_path, _LAST_NON_EMPTY_DELTA_TEMPLATE.format(file_path))
     started_reading = time.time()
-    with open(file_path, "a+") as fp:
+    # Use w+ mode; should overwrite whatever was in the prior delta file
+    with open(file_path, "w+") as fp:
         while timeout is None or time.time() - started_reading < timeout:
             line = read_handle.readline()
             if len(line) > 0:
@@ -47,7 +47,6 @@ def _flush_to_file(file_path, read_handle, uploader, remote_prefix, timeout=None
             else:
                 break  # no more to read right now; go ahead and flush
             fp.flush()
-    Path(file_path).touch(exist_ok=True)  # just to ensure the file exists
     uploader(file_path, remote_prefix)
 
 
@@ -80,11 +79,11 @@ def _stream_logs_to_remote_from_file_descriptor(
 
     def do_exit(signal_num, frame):
         # unregister so we don't do this multiple times
-        signal.signal(signal.SIGINT, lambda *_, **__: None)
+        signal.signal(signal.SIGTERM, lambda *_, **__: None)
         _flush_to_file(file_path, read_handle, uploader, remote_prefix)
         os._exit(0)
 
-    signal.signal(signal.SIGINT, do_exit)
+    signal.signal(signal.SIGTERM, do_exit)
     while True:
         _flush_to_file(
             file_path,
@@ -163,7 +162,6 @@ def ingested_logs(
     file_path: str,
     remote_prefix: str,
     upload_interval_seconds=DEFAULT_LOG_UPLOAD_INTERVAL_SECONDS,
-    max_tail_bytes: int = 2**13,
     uploader: Optional[Callable[[str, str], None]] = None,
 ):
     """Code within context will have stdout/stderr (including subprocess) ingested
@@ -180,15 +178,9 @@ def ingested_logs(
         The amount of time between uploads
     remote_prefix:
         The prefix for the remote storage location where ingested logs live
-    max_tail_bytes:
-        The maximum number of bytes of logs to print to the original stdout
-        when the context exits. To disable, set to <=0. Defaults to 8kb
     uploader:
         An optional override for uploading the log file.
     """
-    # we will eventually want to switch to use a pipe instead of file as the
-    # buffer the subprocess reads from:
-    # https://stackoverflow.com/questions/73821235/python-file-truncate-with-one-writer-and-one-reader?noredirect=1#comment130351264_73821235
     uploader = uploader if uploader is not None else _do_upload
 
     pod_name = os.getenv(KUBERNETES_POD_NAME_ENV_VAR)
@@ -211,12 +203,14 @@ def ingested_logs(
             # use a timeout so the parent process can still exit if
             # the child hangs for some reason (ex: during remote upload)
             _send_signal_or_kill(streamer_pid, signal_num, timeout_seconds=10)
-        if original_signal_handler is not None:
+        if original_signal_handler is not None and hasattr(
+            original_signal_handler, "__call__"
+        ):
             original_signal_handler(signal_num, frame)
 
     read_file_descriptor = None
     write_file_descriptor = None
-    original_signal_handler = signal.signal(signal.SIGINT, clean_up_streamer)
+    original_signal_handler = signal.signal(signal.SIGTERM, clean_up_streamer)
     try:
         read_file_descriptor, write_file_descriptor = os.pipe()
         os.set_blocking(read_file_descriptor, False)
@@ -238,7 +232,7 @@ def ingested_logs(
                 traceback.print_exc()
                 raise
             finally:
-                signal.signal(signal.SIGINT, original_signal_handler)
+                signal.signal(signal.SIGTERM, original_signal_handler)
                 original_signal_handler = None
 
                 # ensure there's a final log upload, and that it contains ALL the
@@ -247,7 +241,7 @@ def ingested_logs(
                 sys.stdout.flush()
                 sys.stderr.flush()
 
-                clean_up_streamer(signal.SIGINT)
+                clean_up_streamer(signal.SIGTERM)
     finally:
         # outermost try/finally is so we can tail logs to non-redirected stdout
         # even if the code raised an error
@@ -259,7 +253,7 @@ def ingested_logs(
         # true when the problem is something with the "normal" logging mechanisms, like
         # a failure to upload the logs to remote. Having *some* way to see what the code
         # was doing before it died will be essential.
-        _tail_log_file(file_path, max_tail_bytes)
+        _tail_log_file(file_path)
         if read_file_descriptor is not None:
             os.close(read_file_descriptor)
         if write_file_descriptor is not None:
@@ -293,36 +287,26 @@ def _send_signal_or_kill(pid: int, signal_num: int, timeout_seconds: int):
         return  # process already gone
 
 
-def _tail_log_file(file_path, max_tail_bytes, print_func=None):
+def _tail_log_file(file_path, print_func=None):
     """Print the last lines of the log file.
 
     The code will quickly traverse to the correct file location rather than reading
     through the whole log.
     """
     print_func = print_func if print_func is not None else print
-    if max_tail_bytes <= 0:
-        return
+    print_func(
+        "Showing the tail of the logs for reference. For complete "
+        "logs, please use the UI. This contains the last delta or two "
+        "of log lines uploaded to remote storage."
+    )
 
-    n_bytes_in_file = os.stat(file_path)[stat.ST_SIZE]
+    print_func("\t\t.\n\t\t.\n\t\t.")  # vertical '...' to show there's truncation
+    previous_path = _LAST_NON_EMPTY_DELTA_TEMPLATE.format(file_path)
+    if os.path.exists(previous_path):
+        with open(previous_path, "r") as fp:
+            for line in fp:
+                print_func(line, end="")
+
     with open(file_path, "r") as fp:
-        print_func(
-            "Showing the tail of the logs for reference. For complete "
-            "logs, please use the UI."
-        )
-        start_byte = max(0, n_bytes_in_file - max_tail_bytes)
-        if start_byte != 0:
-            print_func(
-                "\t\t.\n\t\t.\n\t\t."
-            )  # vertical '...' to show there's truncation
-
-        # Why seek rather than just iterate through lines until we're near the end?
-        # because log files may be GBs in size, and we want this operation to be
-        # a quick debugging aid, and not slow down container execution by a lot
-        # while we actually read the whole file.
-        fp.seek(start_byte)
-        for line_number, line in enumerate(fp):
-            if start_byte != 0 and line_number == 0:
-                # we may have done a seek mid-line. skip the first line so we don't show
-                # something partial.
-                continue
+        for line in fp:
             print_func(line, end="")
