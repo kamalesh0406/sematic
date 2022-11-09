@@ -16,14 +16,32 @@ from sematic.utils.stdout import redirect_to_file_descriptor
 
 """
 An overview of how logging works:
-- stdout and stderr are redirected to a file from the Sematic worker
-- the Sematic worker on launch starts a child process that periodically
-    uses our storage abstraction to upload the log file to persistent storage
+- stdout and stderr are redirected to a pipe from the Sematic worker
+- the Sematic worker on launch starts a child process that reads from the
+    pipe line-by-line and writes the result to a file on disk
+- periodically, the worker uses our storage abstraction to upload the log file
+    to persistent storage. The file is reset between uploads so that each upload
+    is a "delta" containing only the new lines since the last upload
+- when the worker exits, it does one final upload. The main process always
+    tells the worker to exit after it is done redirecting its stdout
 - the name of the logs on the remote contain metadata about what run and job type
    the logs came from
 - the server reads the logs from persistent storage for UI display
 - it's safe to assume that the worker will have write access to the persistent storage
   because it's the same bucket used for artifacts.
+
+Q: Why do we use lower-level "os" mechanisms rather than subprocess/multiprocess?
+A: The pipe mechanisms for the "multiprocess" module assumes that the parent process
+    is the one capturing the stdout of its child. We want the child to capture the
+    stdout of its parent. Why? Because we want the parent process to represent the "real"
+    work. There are a few reasons for this. One is so that the exit code for the parent
+    process represents the exit code for the real work. Another is so that if other
+    infra (ex: k8s) sends signals to the parent process, they reach the process doing
+    the "real work" first, which means there is a lower chance of weird issues with
+    forwarding that signal to children and cleaning up properly afterwards. It also
+    just makes more sense from a mental-model standpoint to have the daemon-like
+    process be the child while the "parent" process and the "main" process are the
+    same.
 """
 
 
@@ -31,14 +49,41 @@ DEFAULT_LOG_UPLOAD_INTERVAL_SECONDS = 10
 _LAST_NON_EMPTY_DELTA_TEMPLATE = "{}.previous"
 
 
-def _flush_to_file(file_path, read_handle, uploader, remote_prefix, timeout=None):
-    if os.path.exists(file_path) and os.stat(file_path)[stat.ST_SIZE] > 0:
-        # save the last non-empty delta file somewhere for tailing
-        os.rename(file_path, _LAST_NON_EMPTY_DELTA_TEMPLATE.format(file_path))
+def _flush_to_file(file_path, read_handle, uploader, remote_prefix, timeout_seconds=None):
+    """Read from the read_handle dump to file_path and then remote.
+
+    The read_handle is continuously streamed from onto disk. The remote upload will
+    only happen once (a) the timeout is reached OR (b) there are no more contents
+    from the read handle. Once a remote upload has been performed, this exits.
+
+    Parameters
+    ----------
+    file_path:
+        Path of the file to stream the read_handle contents to. This will contain the
+        log file "delta"
+    read_handle:
+        A readable object that can be streamed from. It should be configured such that
+        reads are non-blocking.
+    uploader:
+        The function to call for performing the remote upload
+    remote_prefix:
+        The prefix for the remote storage location where the log files will be kept.
+        The actual file name will be unique for each upload, increasing monoatonically
+        with time
+    timeout_seconds:
+        The max number of seconds between when streaming from the read handle starts and
+        when the upload occurs.
+    """
+    if os.path.exists(file_path):
+        if os.stat(file_path)[stat.ST_SIZE] > 0:
+            # save the last non-empty delta file somewhere for tailing
+            os.rename(file_path, _LAST_NON_EMPTY_DELTA_TEMPLATE.format(file_path))
+        else:
+            os.remove(file_path)
     started_reading = time.time()
     # Use w+ mode; should overwrite whatever was in the prior delta file
     with open(file_path, "w+") as fp:
-        while timeout is None or time.time() - started_reading < timeout:
+        while timeout_seconds is None or time.time() - started_reading < timeout_seconds:
             line = read_handle.readline()
             if len(line) > 0:
                 # The line would at least have the newline char if it was a blank.
@@ -57,7 +102,9 @@ def _stream_logs_to_remote_from_file_descriptor(
     remote_prefix: str,
     uploader: Callable[[str, str], None],
 ):
-    """Execute infinite loop to periodically upload from file_path to remote storage
+    """Execute infinite loop to periodically upload from file_path to remote storage.
+
+    Should ONLY be called from a process dedicated to log streaming.
 
     Parameters
     ----------
@@ -90,7 +137,7 @@ def _stream_logs_to_remote_from_file_descriptor(
             read_handle,
             uploader,
             remote_prefix,
-            timeout=upload_interval_seconds,
+            timeout_seconds=upload_interval_seconds,
         )
 
 
@@ -201,8 +248,8 @@ def ingested_logs(
         if streamer_pid is not None:
             # forwarding the signal should trigger a final upload.
             # use a timeout so the parent process can still exit if
-            # the child hangs for some reason (ex: during remote upload)
-            _send_signal_or_kill(streamer_pid, signal_num, timeout_seconds=10)
+            # the child hangs for some reason (ex: during remote service call)
+            _send_signal_or_kill(streamer_pid, signal_num, timeout_seconds=20)
         if original_signal_handler is not None and hasattr(
             original_signal_handler, "__call__"
         ):
@@ -288,16 +335,12 @@ def _send_signal_or_kill(pid: int, signal_num: int, timeout_seconds: int):
 
 
 def _tail_log_file(file_path, print_func=None):
-    """Print the last lines of the log file.
-
-    The code will quickly traverse to the correct file location rather than reading
-    through the whole log.
-    """
+    """Print the last lines of the last 1 or 2 log file deltas."""
     print_func = print_func if print_func is not None else print
     print_func(
         "Showing the tail of the logs for reference. For complete "
-        "logs, please use the UI. This contains the last delta or two "
-        "of log lines uploaded to remote storage."
+        "logs, please use the UI. This contains the last file or two "
+        "of log line deltas uploaded to remote storage."
     )
 
     print_func("\t\t.\n\t\t.\n\t\t.")  # vertical '...' to show there's truncation
