@@ -1,18 +1,19 @@
 # Standard Library
 import contextlib
-import multiprocessing
 import os
+import signal
 import stat
 import sys
 import time
 import traceback
+from pathlib import Path
 from typing import Callable, Optional
 
 # Sematic
 from sematic.config import KUBERNETES_POD_NAME_ENV_VAR
 from sematic.storage import S3Storage
 from sematic.utils.retry import retry
-from sematic.utils.stdout import redirect_to_file
+from sematic.utils.stdout import redirect_to_file_descriptor
 
 """
 An overview of how logging works:
@@ -30,8 +31,29 @@ An overview of how logging works:
 DEFAULT_LOG_UPLOAD_INTERVAL_SECONDS = 10
 
 
-def _stream_logs_to_remote_from_file(
+def _flush_to_file(file_path, read_handle, uploader, remote_prefix, timeout=None):
+    if os.path.exists(file_path):
+        # we only want to record "deltas" in the logs; clean up before each
+        # session of streaming to file.
+        os.remove(file_path)
+    started_reading = time.time()
+    with open(file_path, "a+") as fp:
+        while timeout is None or time.time() - started_reading < timeout:
+            line = read_handle.readline()
+            if len(line) > 0:
+                # The line would at least have the newline char if it was a blank.
+                # hence the "if"
+                fp.write(line)
+            else:
+                break  # no more to read right now; go ahead and flush
+            fp.flush()
+    Path(file_path).touch(exist_ok=True)  # just to ensure the file exists
+    uploader(file_path, remote_prefix)
+
+
+def _stream_logs_to_remote_from_file_descriptor(
     file_path: str,
+    read_from_file_descriptor: int,
     upload_interval_seconds: int,
     remote_prefix: str,
     uploader: Callable[[str, str], None],
@@ -42,6 +64,8 @@ def _stream_logs_to_remote_from_file(
     ----------
     file_path:
         The path to the local file that's being uploaded
+    read_from_file_descriptor:
+        The file descriptor that's being read from.
     upload_interval_seconds:
         The amount of time between the end of one upload and the start of the next
     remote_prefix:
@@ -52,9 +76,23 @@ def _stream_logs_to_remote_from_file(
         A callable to perform the upload. It will be given the path to upload from and
         the remote prefix as arguments.
     """
+    read_handle = os.fdopen(read_from_file_descriptor)
+
+    def do_exit(signal_num, frame):
+        # unregister so we don't do this multiple times
+        signal.signal(signal.SIGINT, lambda *_, **__: None)
+        _flush_to_file(file_path, read_handle, uploader, remote_prefix)
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, do_exit)
     while True:
-        uploader(file_path, remote_prefix)
-        time.sleep(upload_interval_seconds)
+        _flush_to_file(
+            file_path,
+            read_handle,
+            uploader,
+            remote_prefix,
+            timeout=upload_interval_seconds,
+        )
 
 
 @retry(tries=3, delay=5)
@@ -77,10 +115,11 @@ def _do_upload(file_path: str, remote_prefix: str):
 
 def _start_log_streamer_out_of_process(
     file_path: str,
+    read_from_file_descriptor: int,
     upload_interval_seconds: int,
     remote_prefix: str,
     uploader: Callable[[str, str], None],
-) -> multiprocessing.Process:
+) -> int:
     """Start a subprocess to periodically upload the log file to remote storage
 
     Note that the caller should always call do_upload before terminating to ensure
@@ -90,6 +129,8 @@ def _start_log_streamer_out_of_process(
     ----------
     file_path:
         The path to the local log file
+    read_from_file_descriptor:
+        The file descriptor to read from; likely the "read" end of a pipe
     upload_interval_seconds:
         The interval between uploads.
     uploader:
@@ -97,22 +138,24 @@ def _start_log_streamer_out_of_process(
 
     Returns
     -------
-    The process doing the logging
+    The process id of the process doing the logging
     """
     kwargs = dict(
         file_path=file_path,
+        read_from_file_descriptor=read_from_file_descriptor,
         upload_interval_seconds=upload_interval_seconds,
         remote_prefix=remote_prefix,
         uploader=uploader,
     )
-    process = multiprocessing.Process(
-        group=None,
-        target=_stream_logs_to_remote_from_file,
-        kwargs=kwargs,
-        daemon=True,
-    )
-    process.start()
-    return process
+    pid = os.fork()
+    if pid > 0:
+        # in parent process
+        return pid
+    else:
+        # in child process
+        _stream_logs_to_remote_from_file_descriptor(**kwargs)  # type: ignore
+        # can't ever reach here; the above is an infinite loop
+        raise RuntimeError("This code should be unreachable!")
 
 
 @contextlib.contextmanager
@@ -158,11 +201,30 @@ def ingested_logs(
             f"To follow these logs, try:\n\t"
             f"kubectl exec -i {pod_name} -- tail -f {file_path}"
         )
-    final_upload_error = None
+
+    original_signal_handler = None
+    streamer_pid = None
+
+    def clean_up_streamer(signal_num, frame=None):
+        if streamer_pid is not None:
+            # forwarding the signal should trigger a final upload.
+            # use a timeout so the parent process can still exit if
+            # the child hangs for some reason (ex: during remote upload)
+            _send_signal_or_kill(streamer_pid, signal_num, timeout_seconds=10)
+        if original_signal_handler is not None:
+            original_signal_handler(signal_num, frame)
+
+    read_file_descriptor = None
+    write_file_descriptor = None
+    original_signal_handler = signal.signal(signal.SIGINT, clean_up_streamer)
     try:
-        with redirect_to_file(file_path):
-            process = _start_log_streamer_out_of_process(
+        read_file_descriptor, write_file_descriptor = os.pipe()
+        os.set_blocking(read_file_descriptor, False)
+        os.set_inheritable(read_file_descriptor, True)
+        with redirect_to_file_descriptor(write_file_descriptor):
+            streamer_pid = _start_log_streamer_out_of_process(
                 file_path,
+                read_file_descriptor,
                 upload_interval_seconds=upload_interval_seconds,
                 remote_prefix=remote_prefix,
                 uploader=uploader,
@@ -176,7 +238,8 @@ def ingested_logs(
                 traceback.print_exc()
                 raise
             finally:
-                process.terminate()
+                signal.signal(signal.SIGINT, original_signal_handler)
+                original_signal_handler = None
 
                 # ensure there's a final log upload, and that it contains ALL the
                 # contents of stdout and stderr before we redirect them back to their
@@ -184,15 +247,10 @@ def ingested_logs(
                 sys.stdout.flush()
                 sys.stderr.flush()
 
-                try:
-                    uploader(file_path, remote_prefix)
-                except Exception as e:
-                    final_upload_error = e
+                clean_up_streamer(signal.SIGINT)
     finally:
         # outermost try/finally is so we can tail logs to non-redirected stdout
         # even if the code raised an error
-        if final_upload_error is not None:
-            print(f"Error with final log upload: {final_upload_error}", file=sys.stderr)
 
         # Why is this tailing useful? Because in the situations where somebody
         # is triaging some weird, complicated failure mode, it will be really helpful to
@@ -202,6 +260,37 @@ def ingested_logs(
         # a failure to upload the logs to remote. Having *some* way to see what the code
         # was doing before it died will be essential.
         _tail_log_file(file_path, max_tail_bytes)
+        if read_file_descriptor is not None:
+            os.close(read_file_descriptor)
+        if write_file_descriptor is not None:
+            os.close(write_file_descriptor)
+
+
+def _send_signal_or_kill(pid: int, signal_num: int, timeout_seconds: int):
+    """Send the signal to the given pid. If not exited by timeout, send SIGKILL
+
+    Parameters
+    ----------
+    pid:
+        The pid of the process to kill
+    signal_num:
+        The initial signal to send. Will be sent repeatedly until the process
+        terminates or the timeout occurs
+    timeout_seconds:
+        The maximum time to wait before sending a SIGKILL
+    """
+    try:
+        started = time.time()
+        while time.time() - started < timeout_seconds:
+            os.kill(pid, signal_num)
+            wait_result = os.waitpid(pid, os.WNOHANG)
+            if wait_result is None:
+                return
+            time.sleep(0.1)
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    except ProcessLookupError:
+        return  # process already gone
 
 
 def _tail_log_file(file_path, max_tail_bytes, print_func=None):

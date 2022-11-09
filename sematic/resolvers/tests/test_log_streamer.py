@@ -11,7 +11,7 @@ from sematic.utils.retry import retry
 
 @retry(AssertionError, tries=3)  # this test is somewhat dependent on relative timings.
 def test_ingested_logs():
-    with tempfile.NamedTemporaryFile() as log_file:
+    with tempfile.NamedTemporaryFile(delete=False) as log_file:
         remote_prefix = "foo/bar"
         upload_interval = 0.1
         with ingested_logs(
@@ -37,25 +37,22 @@ def test_ingested_logs():
 
     assert len(uploads) > 1  # should be at least one timed, and the final flush
 
-    # early uploads should have only contained early writes
-    assert any(
-        upload
-        == [
-            f"{remote_prefix}\n",
-            "From stdout\n",
-            "From stderr\n",
-        ]
-        for upload in uploads
-    )
-
-    # last upload should have everything
-    assert uploads[-1] == [
-        f"{remote_prefix}\n",
+    everything = [
         "From stdout\n",
         "From stderr\n",
         "From stdout late\n",
         "From stderr late\n",
     ]
+
+    # early uploads should have only early stuff, late uploads should
+    # have late stuff. So no single upload should have everything.
+    assert not any(upload == [f"{remote_prefix}\n"] + everything for upload in uploads)
+
+    all_upload_contents = concat_uploads(uploads)
+
+    # everything uploaded should contain all log lines, with
+    # no duplicated lines.
+    assert all_upload_contents == everything
 
 
 def test_ingested_logs_uncaught():
@@ -63,7 +60,7 @@ def test_ingested_logs_uncaught():
     started = time.time()
     message = "Uncaught error!"
     try:
-        with tempfile.NamedTemporaryFile() as log_file:
+        with tempfile.NamedTemporaryFile(delete=False) as log_file:
             remote_prefix = "foo/bar"
             upload_interval = 100  # should exit early despite the long interval
             with ingested_logs(
@@ -86,7 +83,7 @@ def test_ingested_logs_uncaught():
         upload_number += 1
 
     assert len(uploads) >= 1
-    assert message in "\n".join(uploads[-1])
+    assert message in "\n".join(concat_uploads(uploads))
 
 
 def test_tail_log_file():
@@ -95,7 +92,7 @@ def test_tail_log_file():
     def print_func(to_print, end="\n", **kwargs):
         printed.append(to_print + end)
 
-    with tempfile.NamedTemporaryFile() as log_file:
+    with tempfile.NamedTemporaryFile(delete=False) as log_file:
         remote_prefix = "foo/bar"
         upload_interval = 0.1
         line_template = "This is line {}"
@@ -156,3 +153,12 @@ def mock_uploader(file_path, remote_prefix):
         with open(file_path, "rb") as log:
             for line in log:
                 record.write(line)
+
+
+def concat_uploads(uploads):
+    all_upload_contents = []
+    for upload in uploads:
+        all_upload_contents.extend(
+            upload[1:]
+        )  # 1st line of each upload is remote prefix
+    return all_upload_contents
