@@ -238,7 +238,7 @@ def ingested_logs(
         # it will go to stdout before stdout gets redirected.
         print(
             f"To follow these logs, try:\n\t"
-            f"kubectl exec -i {pod_name} -- tail -f {file_path}"
+            f"kubectl exec -i {pod_name} -- tail {file_path}"
         )
 
     original_signal_handler = None
