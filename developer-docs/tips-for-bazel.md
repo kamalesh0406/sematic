@@ -93,3 +93,30 @@ You can also do *this* with specific python interpreters:
 ```
 $ bazel run //sematic/cli:main_py39 -- --help
 ```
+
+## Troubleshooting
+
+### CPP Toolchain Error
+If you get an error message like:
+
+`"No matching toolchains found for types @bazel_tools//tools/cpp:toolchain_type"`,
+this means bazel can't find your c++ tooling. This can either be due to the fact that
+bazel can't find ANY c++ tooling OR the fact that it can't find c++ tooling suitable
+for building linux docker images.
+
+#### Totally missing c++ tooling
+```
+$ bazel test --toolchain_resolution_debug=@bazel_tools//tools/cpp:toolchain_type //sematic/...
+```
+
+On Macs this is often due to a problem with Xcode. If you are on a Mac:
+- Make sure you have xcode installed
+- Execute `sudo xcodebuild -license` and agree to the license
+- If the above command gives you an error about CommandLineTools and won't show
+the License, try [this](https://stackoverflow.com/a/72115137/2540669)
+
+#### Missing c++ tooling for cross platform docker images
+Just do this:
+```
+$ bazel test --@io_bazel_rules_docker//transitions:enable=false //sematic/...
+```
