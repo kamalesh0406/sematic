@@ -1,6 +1,7 @@
 #!/bin/bash
 
 SETTINGS_FILE="$HOME/.sematic/settings.yaml"
+BACKUP_LOCATION="${SETTINGS_FILE}_bck"
 USAGE="\n
 Overwrites your $SETTINGS_FILE with the contents of a file that is expected to be found at $SETTINGS_FILE.<env_name>\n
 Usage: bazel run //bazel:switch-settings -- <env_name>
@@ -23,6 +24,7 @@ if [ ! -f "$ENV_FILE" ]; then
   exit_with_usage "The file $ENV_FILE does not exist!"
 fi
 
+cp "$SETTINGS_FILE" "$BACKUP_LOCATION"
 cp "$ENV_FILE" "$SETTINGS_FILE"
 
 echo -e "Successfully switched to $1!\n"
