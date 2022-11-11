@@ -1,9 +1,7 @@
 # Standard Library
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional
-from typing import OrderedDict as OrderedDictType
-from typing import Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, OrderedDict as OrderedDictType, Tuple, Type, Union
 
 # Sematic
 from sematic.abstract_future import AbstractFuture, FutureState
@@ -448,7 +446,12 @@ class Graph:
 
         func = run.get_func()
 
-        future = func(**kwargs)
+        if run.calculator_path == "sematic.calculator._make_list":
+            input_list = list(kwargs.values())
+            future = func(_get_list_type(input_list), input_list)  # type: ignore
+        else:
+            future = func(**kwargs)
+
         future.name = run.name
 
         cloned_graph.input_artifacts[future.id] = run_input_artifacts
@@ -545,3 +548,23 @@ class Graph:
         cloned_graph.sort_by(run_ids_by_reverse_execution_order)
 
         return cloned_graph
+
+
+def _get_list_type(list_: List[Any]) -> Type[List]:
+    if len(list_) == 0:
+        return List[Any]
+
+    element_type = None
+
+    for item in list_:
+        item_type = (
+            item.calculator.output_type
+            if isinstance(item, AbstractFuture)
+            else type(item)
+        )
+        if element_type is None:
+            output_type = item_type
+        elif output_type != item_type:
+            output_type = Union[output_type, item_type]
+
+    return List[element_type]  # type: ignore
