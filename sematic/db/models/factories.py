@@ -23,6 +23,7 @@ from sematic.types.serialization import (
     value_from_json_encodable,
     value_to_json_encodable,
 )
+from sematic.types.types.union import get_value_type, is_union
 
 
 def make_run_from_future(future: AbstractFuture) -> Run:
@@ -148,6 +149,8 @@ def make_artifact(
     """
     Create an Artifact model instance from a value and type.
     """
+    if is_union(type_):
+        type_ = get_value_type(value, type_)
     type_serialization = type_to_json_encodable(type_)
     value_serialization = value_to_json_encodable(value, type_)
     json_summary = get_json_encodable_summary(value, type_)
