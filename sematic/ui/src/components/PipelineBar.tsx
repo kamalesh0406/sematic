@@ -10,19 +10,18 @@ import {
   Typography,
   useTheme,
 } from "@mui/material";
-import { useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo } from "react";
 import { UserContext } from "..";
 import { Resolution, Run } from "../Models";
-import { RunListPayload } from "../Payloads";
 import { fetchJSON, pipelineSocket } from "../utils";
 import CalculatorPath from "./CalculatorPath";
 import GitInfoBox from "./GitInfo";
 import Loading from "./Loading";
-import { RunFilterType } from "./RunList";
 import RunStateChip from "./RunStateChip";
 import TimeAgo from "./TimeAgo";
 import { ActionMenu, ActionMenuItem } from "./ActionMenu";
 import { SnackBarContext } from "./SnackBarProvider";
+import { useFetchRuns, usePipelineNavigation } from "../hooks/pipelineHooks";
 
 function PipelineActionMenu(props: {
   rootRun: Run;
@@ -127,80 +126,59 @@ function PipelineActionMenu(props: {
 
 export default function PipelineBar(props: {
   calculatorPath: string;
-  onRootIdChange: (rootId: string) => void;
   rootRun?: Run;
   resolution?: Resolution;
 }) {
-  const { calculatorPath, onRootIdChange, rootRun, resolution } =
-    props;
-  const [error, setError] = useState<Error | undefined>(undefined);
-  const [isLoaded, setIsLoaded] = useState(false);
-  const [latestRuns, setLatestRuns] = useState<Run[]>([]);
-  const { user } = useContext(UserContext);
+  const { calculatorPath, rootRun, resolution } = props;
   const { setSnackMessage } = useContext(SnackBarContext);
 
   const theme = useTheme();
 
-  const fetchLatestRuns = useCallback(
-    (calcPath: string, onResults: (runs: Run[]) => void) => {
-      const runFilters: RunFilterType = {
-        AND: [
-          { parent_id: { eq: null } },
-          { calculator_path: { eq: calcPath } },
-        ],
-      };
+  const runFilters = useMemo(() => ({
+    AND: [
+      { parent_id: { eq: null } },
+      { calculator_path: { eq: calculatorPath } },
+    ],
+  }), [calculatorPath]);
 
-      fetchJSON({
-        url: "/api/v1/runs?limit=10&filters=" + JSON.stringify(runFilters),
-        apiKey: user?.api_key,
-        callback: (response: RunListPayload) => {
-          onResults(response.content);
-        },
-        setError: setError,
-        setIsLoaded: setIsLoaded,
-      });
-    },
-    []
-  );
+  const otherQueryParams = useMemo(() => ({
+      limit: '10'
+  }), []);
 
-  useEffect(() => {
-    fetchLatestRuns(calculatorPath, (runs: Run[]) => {
-      setLatestRuns(runs);
-    });
-  }, [calculatorPath]);
+  const {isLoaded, error, runs: latestRuns, reloadRuns } = useFetchRuns(runFilters, otherQueryParams);
+
+  const navigate = usePipelineNavigation(calculatorPath!);
+
+  const changeRootId = useCallback((runId: string) => {
+    navigate(runId);
+  }, [navigate]);
 
   useEffect(() => {
     pipelineSocket.removeAllListeners("update");
-    pipelineSocket.on("update", (args: { calculator_path: string }) => {
+    pipelineSocket.on("update", async (args: { calculator_path: string }) => {
       if (args.calculator_path === calculatorPath) {
-        fetchLatestRuns(calculatorPath, (runs) => {
-          if (runs[0].id !== latestRuns[0].id) {
-            setSnackMessage({
-              message: "New run available.",
-              actionName: "view",
-              autoHide: false,
-              closable: true,
-              onClick: () => onRootIdChange(runs[0].id),
-            });
-          }
-          setLatestRuns(runs);
-        });
+        const runs = await reloadRuns();
+        if (runs[0].id !== latestRuns[0].id) {
+          setSnackMessage({
+            message: "New run available.",
+            actionName: "view",
+            autoHide: false,
+            closable: true,
+            onClick: () => changeRootId(runs[0].id),
+          });
+        }
       }
     });
-  }, [latestRuns, calculatorPath, fetchLatestRuns]);
+  }, [latestRuns, calculatorPath, changeRootId, reloadRuns, setSnackMessage]);
 
   const onSelect = useCallback(
-    (event: SelectChangeEvent) => {
-      onRootIdChange(event.target.value);
+    ({ target: { value } }: SelectChangeEvent) => {
+      changeRootId(value);
     },
-    [onRootIdChange]
+    [changeRootId]
   );
 
-  const onCancel = useCallback(() => {
-    fetchLatestRuns(calculatorPath, (runs) => {
-      setLatestRuns(runs);
-    });
-  }, [setLatestRuns, fetchLatestRuns]);
+  const onCancel = reloadRuns;
 
   if (error || !isLoaded) {
     return (
@@ -279,20 +257,20 @@ export default function PipelineBar(props: {
               label="Latest runs"
               onChange={onSelect}
             >
-              {latestRuns.map((run) => (
-                <MenuItem value={run.id} key={run.id}>
+              {latestRuns.map(({id, future_state, created_at}) => (
+                <MenuItem value={id} key={id}>
                   <Typography
                     component="span"
                     sx={{ display: "flex", alignItems: "center" }}
                   >
-                    <RunStateChip state={run.future_state} />
+                    <RunStateChip state={future_state} />
                     <Box>
                       <Typography sx={{ fontSize: "small", color: "GrayText" }}>
-                        <code>{run.id.substring(0, 6)}</code>
+                        <code>{id.substring(0, 6)}</code>
                       </Typography>
                     </Box>
                     <Box ml={3}>
-                      <TimeAgo date={run.created_at} />
+                      <TimeAgo date={created_at} />
                     </Box>
                   </Typography>
                 </MenuItem>

@@ -99,6 +99,12 @@ class Calculator(AbstractCalculator):
             )
 
     def __repr__(self):
+        return self.get_func_fqpn()
+
+    def get_func_fqpn(self):
+        """
+        Returns the fully qualified path name of the func.
+        """
         return "{}.{}".format(self.__module__, self.__name__)
 
     def get_source(self) -> str:
@@ -254,9 +260,40 @@ def func(
     resource_requirements: Optional[ResourceRequirements] = None,
     retry: Optional[RetrySettings] = None,
     base_image_tag: Optional[str] = None,
-) -> Union[Callable, Calculator]:
+) -> Union[Calculator, Callable]:
     """
-    Sematic Function decorator.
+    The Sematic Function decorator.
+
+    This identifies the function as a unit of work that Sematic knows about for
+    tracking and scheduling. The function's execution details will be exposed
+    in the Sematic UI.
+
+    Parameters
+    ----------
+    func: Optional[Callable]
+        The `Callable` to instrument; usually the decorated function.
+
+    inline: bool
+        When using the `CloudResolver`, whether the instrumented function
+        should be executed inside the same process and worker that is executing
+        the `Resolver` itself.
+
+        Defaults to `True`, as most pipeline functions are expected to be
+        lightweight. Explicitly set this to `False` in order to distribute its
+        execution to a worker and parallelize its execution.
+
+    resource_requirements: Optional[ResourceRequirements]
+        When using the `CloudResolver`, specifies what special execution
+        resources the function requires. Defaults to `None`.
+
+    retry: Optional[RetrySettings]
+        Specifies in case of which Exceptions the function's execution should
+        be retried, and how many times. Defaults to `None`.
+
+    Returns
+    -------
+    Union[Calculator, Callable]
+        An internal instrumentation wrapper over the decorated function.
     """
     if inline and resource_requirements is not None:
         raise ValueError(

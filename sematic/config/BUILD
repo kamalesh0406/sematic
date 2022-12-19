@@ -18,29 +18,26 @@ sematic_py_lib(
     pip_deps = [
         "pyyaml",
     ],
-    deps = [],
+    deps = [
+        ":config_dir",
+        "//sematic:abstract_plugin",
+        "//sematic:versions",
+    ],
 )
 
 sematic_py_lib(
     name = "server_settings",
     srcs = ["server_settings.py"],
-    pip_deps = [
-        "pyyaml",
-    ],
     deps = [
-        ":config_dir",
         ":settings",
+        "//sematic:abstract_plugin",
     ],
 )
 
 sematic_py_lib(
     name = "user_settings",
     srcs = ["user_settings.py"],
-    pip_deps = [
-        "pyyaml",
-    ],
     deps = [
-        ":config_dir",
         ":settings",
     ],
 )

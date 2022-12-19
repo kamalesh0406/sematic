@@ -1,70 +1,50 @@
-import { Alert, Box } from "@mui/material";
-import { useCallback, useContext, useState } from "react";
-import { UserContext } from "..";
+import { Alert, Box, TextField } from "@mui/material";
+import { useCallback, useState } from "react";
 import { Run } from "../Models";
-import { LogLineRequestResponse } from "../Payloads";
-import { fetchJSON } from "../utils";
 import { Exception, ExternalException } from "./Exception";
-import ScrollingLogView, { MoreLinesCallback } from "./ScrollingLogView";
+import ScrollingLogView from "./ScrollingLogView";
 
 export default function LogPanel(props: { run: Run }) {
   const { run } = props;
-  const { user } = useContext(UserContext);
   const [error, setError] = useState<Error | undefined>(undefined);
+  const [filterString, setFilterString] = useState<string>("");
 
-  const loadLogs = useCallback(
-    (
-      source: string,
-      cursor: string | null,
-      filterString: string,
-      callback: MoreLinesCallback
-    ) => {
-      var url = "/api/v1/runs/" + source + "/logs?max_lines=2000";
-      if (cursor != null) {
-        url += "&continuation_cursor=" + cursor;
-      }
-      if (filterString.length !== 0) {
-        url += "&filter_string=" + filterString;
-      }
-      fetchJSON({
-        url: url,
-        apiKey: user?.api_key,
-        callback: (payload: LogLineRequestResponse) => {
-          callback(
-            source,
-            filterString,
-            payload.content.lines,
-            payload.content.continuation_cursor,
-            payload.content.log_unavailable_reason
-          );
-        },
-        setError: setError,
-      });
+  const onFilterStringChange = useCallback(
+    (evt: any) => {
+      setFilterString(evt.target.value);
     },
-    [user?.api_key]
+    [setFilterString]
   );
 
   const standardLogView = (
-    <ScrollingLogView getLines={loadLogs} logSource={run.id} />
+    <ScrollingLogView key={`${run.id}---${filterString}`} logSource={run.id} onError={setError} 
+      filterString={filterString} />
   );
   const logErrorView = (
-    <Alert severity="error">
+    <Alert severity="error" sx={{ my: 5 }}>
       The server returned an error when asked for logs for this run.
     </Alert>
   );
   const logView = error === undefined ? standardLogView : logErrorView;
 
   return (
-    <Box sx={{ display: "grid" }} >
-      <Box sx={{ gridRow: 1, paddingBottom: 4, }} >
-        {run.external_exception_metadata_json && <ExternalException
-            exception_metadata={run.external_exception_metadata_json} />}
-      </Box>
-      <Box sx={{ gridRow: 2, paddingBottom: 4, }} >
-        {run.exception_metadata_json &&
-            <Exception exception_metadata={run.exception_metadata_json} />}
-      </Box>
-      <Box sx={{ gridRow: 3, paddingBottom: 4, }} >
+    <Box sx={{ display: "flex", flexGrow: 1 }} >
+      {run.external_exception_metadata_json && <Box sx={{ paddingBottom: 4, }} >
+        <ExternalException
+          exception_metadata={run.external_exception_metadata_json} />
+      </Box>}
+
+      {run.exception_metadata_json && <Box sx={{ paddingBottom: 4, }} >
+        <Exception exception_metadata={run.exception_metadata_json} /></Box>}
+
+      <Box sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column'}} >
+        <TextField
+          variant="standard"
+          fullWidth={true}
+          placeholder={"Filter..."}
+          onChange={onFilterStringChange}
+          style={{ flexShrink: 1 }}
+        />
         {logView}
       </Box>
     </Box>

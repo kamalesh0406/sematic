@@ -24,6 +24,7 @@ from sematic.resolvers.silent_resolver import SilentResolver
 from sematic.storage import LocalStorage, Storage
 from sematic.utils.exceptions import ExceptionMetadata, format_exception_for_run
 from sematic.utils.git import get_git_info
+from sematic.versions import CURRENT_VERSION_STR
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,16 @@ class LocalResolver(SilentResolver):
 
     Each Future's resolution is tracked in the DB as a run. Each individual function's
     input argument and output value is tracked as an artifact.
+
+    Parameters
+    ----------
+    rerun_from: Optional[str]
+        When `None`, the pipeline is resolved from scratch, as normally. When not `None`,
+        must be the id of a `Run` from a previous resolution. Instead of running from
+        scratch, parts of that previous resolution is cloned up until and including the
+        specified `Run`, and only nested and downstream `Future`s are executed. This is
+        meant to be used for retries or for hotfixes, without needing to re-run the
+        entire pipeline again.
     """
 
     def __init__(self, rerun_from: Optional[str] = None, **kwargs):
@@ -233,6 +244,7 @@ class LocalResolver(SilentResolver):
             kind=ResolutionKind.LOCAL,
             git_info=get_git_info(root_future.calculator.func),  # type: ignore
             settings_env_vars=get_active_user_settings_strings(),
+            client_version=CURRENT_VERSION_STR,
         )
 
         return resolution

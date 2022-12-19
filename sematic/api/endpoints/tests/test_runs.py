@@ -200,7 +200,13 @@ def test_schedule_run(
         )
         persisted_resolution.status = ResolutionStatus.RUNNING
         save_resolution(persisted_resolution)
-        response = test_client.post(f"/api/v1/runs/{persisted_run.id}/schedule")
+
+        with mock.patch(
+            "sematic.api.endpoints.runs.broadcast_graph_update"
+        ) as mock_broadcast_graph_update:
+            response = test_client.post(f"/api/v1/runs/{persisted_run.id}/schedule")
+
+            mock_broadcast_graph_update.assert_called_once()
 
         assert response.status_code == 200
 
@@ -300,9 +306,14 @@ def test_update_run_disappeared(
         job.has_infra_failure = True
         mock_k8s.refresh_job.side_effect = lambda j: job
 
-        response = test_client.post(
-            "/api/v1/runs/future_states", json={"run_ids": [persisted_run.id]}
-        )
+        with mock.patch(
+            "sematic.api.endpoints.runs.broadcast_graph_update"
+        ) as mock_broadcast_graph_update:
+            response = test_client.post(
+                "/api/v1/runs/future_states", json={"run_ids": [persisted_run.id]}
+            )
+            mock_broadcast_graph_update.assert_called_once()
+
         assert response.status_code == 200
         payload = response.json
         assert payload == {
@@ -381,7 +392,7 @@ def test_get_run_logs(
         more_after=True,
         lines=["Line 1", "Line 2"],
         continuation_cursor="abc",
-        log_unavailable_reason=None,
+        log_info_message=None,
     )
     mock_load_log_lines.return_value = mock_result
     response = test_client.get("/api/v1/runs/{}/logs".format(persisted_run.id))
